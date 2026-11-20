@@ -1,4 +1,4 @@
-namespace: pre-security-guardian
+namespace: security-guardian
 # El scheduler de escaneo corre dentro del proceso: con más de 1 réplica se duplicarían las notificaciones
 replicaCount: 1
 registry: ghcr.io/juanfranvelilla/security-guardian
