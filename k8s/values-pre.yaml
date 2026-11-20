@@ -1,0 +1,36 @@
+namespace: pre-security-guardian
+# El scheduler de escaneo corre dentro del proceso: con más de 1 réplica se duplicarían las notificaciones
+replicaCount: 1
+registry: ghcr.io/juanfranvelilla/security-guardian
+image:
+  tag: ""   # Lo sobrescribe Jenkins con --set image.tag=<BUILD_NUMBER>
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+
+probes:
+  path: /health
+
+extraEnv:
+  - name: "CHECK_INTERVAL_HOURS"
+    value: "4"
+  - name: "HN_MIN_SCORE"
+    value: "40"
+  - name: "APP_ENV"
+    value: "pre"
+
+# Secret con TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID
+extraEnvFrom:
+  - secretRef:
+      name: security-guardian-secrets
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: 50m
+  limits:
+    memory: "256Mi"
+    cpu: 250m
