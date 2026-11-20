@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Dict, Optional, Set
 import httpx
@@ -5,21 +6,26 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEFAULT_KEYWORDS = [
-    "vulnerability",
     "cve",
+    "vulnerability",
     "exploit",
     "0-day",
     "zero-day",
-    "linux kernel",
-    "rhel",
-    "crio",
-    "kubernetes",
+    "linux",
+    "kernel",
+    "openssl",
     "openssh",
+    "kubernetes",
+    "k8s",
+    "crio",
+    "envoy",
+    "rhel",
+    "security advisory",
 ]
 
 
 class HNScanner:
-    BASE_URL = "https://hn.algolia.com/api/v1/search_by_date"
+    BASE_URL = "https://hacker-news.firebaseio.com/v0"
 
     def __init__(self, min_score: int = 40):
         self.min_score = min_score
@@ -27,55 +33,62 @@ class HNScanner:
 
     async def fetch_security_stories(self, keywords: Optional[List[str]] = None) -> List[Dict]:
         """
-        Queries Hacker News (via Algolia API) for recent stories matching security keywords
-        with at least `min_score` points.
+        Fetches top & new stories from official HN Firebase API concurrently,
+        filtering by security keywords and minimum score.
         """
-        kw = keywords or DEFAULT_KEYWORDS
-        query = " OR ".join(kw)
+        kw = [k.lower() for k in (keywords or DEFAULT_KEYWORDS)]
+        matched_stories: List[Dict] = []
 
-        params = {
-            "tags": "story",
-            "query": query,
-            "numericFilters": f"points>={self.min_score}",
-            "hitsPerPage": 15,
-        }
-
-        stories = []
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(self.BASE_URL, params=params)
-                if res.status_code != 200:
-                    logger.error(f"HN API returned {res.status_code}")
+                # Fetch top and best story IDs
+                top_res = await client.get(f"{self.BASE_URL}/topstories.json")
+                if top_res.status_code != 200:
+                    logger.error(f"Failed to fetch HN topstories: {top_res.status_code}")
                     return []
 
-                data = res.json()
-                hits = data.get("hits", [])
+                story_ids = top_res.json()[:60]  # top 60 stories
 
-                for item in hits:
-                    story_id = str(item.get("objectID"))
+                async def get_story(sid: int):
+                    try:
+                        r = await client.get(f"{self.BASE_URL}/item/{sid}.json")
+                        return r.json() if r.status_code == 200 else None
+                    except Exception:
+                        return None
+
+                items = await asyncio.gather(*[get_story(sid) for sid in story_ids])
+
+                for item in items:
+                    if not item or item.get("type") != "story":
+                        continue
+
+                    story_id = str(item.get("id"))
                     if story_id in self.seen_story_ids:
                         continue
 
-                    title = item.get("title", "Sin título")
-                    points = item.get("points", 0)
-                    url = item.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
-                    hn_url = f"https://news.ycombinator.com/item?id={story_id}"
-                    num_comments = item.get("num_comments", 0)
+                    title = item.get("title", "")
+                    score = item.get("score", 0)
+                    title_lower = title.lower()
 
-                    stories.append({
-                        "id": story_id,
-                        "title": title,
-                        "points": points,
-                        "url": url,
-                        "hn_url": hn_url,
-                        "num_comments": num_comments,
-                        "created_at": item.get("created_at")
-                    })
+                    # Match keyword and score
+                    has_keyword = any(k in title_lower for k in kw)
+                    if has_keyword and score >= self.min_score:
+                        url = item.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
+                        hn_url = f"https://news.ycombinator.com/item?id={story_id}"
+                        matched_stories.append({
+                            "id": story_id,
+                            "title": title,
+                            "points": score,
+                            "url": url,
+                            "hn_url": hn_url,
+                            "num_comments": item.get("descendants", 0),
+                            "created_at": item.get("time")
+                        })
 
         except Exception as e:
-            logger.exception(f"Error fetching stories from HN: {e}")
+            logger.exception(f"Error scanning Hacker News via Firebase: {e}")
 
-        return stories
+        return matched_stories
 
     def mark_as_seen(self, story_id: str):
         self.seen_story_ids.add(story_id)
