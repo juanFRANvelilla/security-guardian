@@ -1,26 +1,74 @@
 import asyncio
 import logging
-from typing import List, Dict, Optional, Set
+import re
+from typing import List, Dict, Optional
 import httpx
+
+from app.services.alert_store import alert_store
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_KEYWORDS = [
-    "cve",
-    "vulnerability",
-    "exploit",
-    "0-day",
-    "zero-day",
-    "linux",
-    "kernel",
-    "openssl",
-    "openssh",
-    "kubernetes",
-    "k8s",
-    "crio",
-    "envoy",
-    "rhel",
-    "security advisory",
+# Only technologies present on the user's RHEL 10 server & K8s cluster
+SERVER_TECH_WHITELIST = [
+    r"\blinux\b",
+    r"\bkernel\b",
+    r"\brhel\b",
+    r"\bred\s*hat\b",
+    r"\bkubernetes\b",
+    r"\bk8s\b",
+    r"\bcri-o\b",
+    r"\bcrio\b",
+    r"\benvoy\b",
+    r"\bopenssl\b",
+    r"\bopenssh\b",
+    r"\bsystemd\b",
+    r"\bglibc\b",
+    r"\bwireguard\b",
+    r"\bsudo\b",
+    r"\bcontainerd\b",
+    r"\blonghorn\b",
+    r"\bpihole\b",
+    r"\bkafka\b",
+    r"\bpostgresql?\b",
+]
+
+# Explicit exclusions for technologies NOT on the server to prevent noise
+BLACKLIST_EXCLUSIONS = [
+    r"\bsynology\b",
+    r"\bqnap\b",
+    r"\bwindows\b",
+    r"\bmacos\b",
+    r"\bios\b",
+    r"\bandroid\b",
+    r"\bcisco\b",
+    r"\bfortinet\b",
+    r"\bivanti\b",
+    r"\bpalo\s*alto\b",
+    r"\bwordpress\b",
+    r"\bphp\b",
+    r"\bexchange\b",
+    r"\boutlook\b",
+    r"\bzoom\b",
+    r"\bteams\b",
+    r"\bchrome\b",
+    r"\bfirefox\b",
+    r"\bsafari\b",
+    r"\bvmware\b",
+    r"\besxi\b",
+]
+
+SECURITY_TRIGGER_WORDS = [
+    r"\bcve\b",
+    r"\bvulnerab\w+",
+    r"\bexploit\w*",
+    r"\b0-day\b",
+    r"\bzero-day\b",
+    r"\bbuffer\s*overflow\b",
+    r"\bprivilege\s*escalat\w+",
+    r"\bremote\s*code\s*execut\w+",
+    r"\brce\b",
+    r"\bsecurity\s*advisory\b",
+    r"\bbackdoor\b",
 ]
 
 
@@ -29,25 +77,39 @@ class HNScanner:
 
     def __init__(self, min_score: int = 40):
         self.min_score = min_score
-        self.seen_story_ids: Set[str] = set()
 
-    async def fetch_security_stories(self, keywords: Optional[List[str]] = None) -> List[Dict]:
+    def is_relevant(self, title: str) -> bool:
+        title_lower = title.lower()
+
+        # 1. Must NOT match any blacklist term
+        for bl in BLACKLIST_EXCLUSIONS:
+            if re.search(bl, title_lower):
+                return False
+
+        # 2. Must match at least one technology from the server whitelist
+        tech_match = any(re.search(wl, title_lower) for wl in SERVER_TECH_WHITELIST)
+        if not tech_match:
+            return False
+
+        # 3. Must match a vulnerability / security trigger term
+        sec_match = any(re.search(st, title_lower) for st in SECURITY_TRIGGER_WORDS)
+        return sec_match
+
+    async def fetch_security_stories(self) -> List[Dict]:
         """
-        Fetches top & new stories from official HN Firebase API concurrently,
-        filtering by security keywords and minimum score.
+        Fetches top stories from HN, strictly filtering for user's Linux & K8s stack,
+        and deduplicating with persistent alert store.
         """
-        kw = [k.lower() for k in (keywords or DEFAULT_KEYWORDS)]
         matched_stories: List[Dict] = []
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # Fetch top and best story IDs
                 top_res = await client.get(f"{self.BASE_URL}/topstories.json")
                 if top_res.status_code != 200:
                     logger.error(f"Failed to fetch HN topstories: {top_res.status_code}")
                     return []
 
-                story_ids = top_res.json()[:60]  # top 60 stories
+                story_ids = top_res.json()[:60]
 
                 async def get_story(sid: int):
                     try:
@@ -62,19 +124,16 @@ class HNScanner:
                     if not item or item.get("type") != "story":
                         continue
 
-                    story_id = str(item.get("id"))
-                    if story_id in self.seen_story_ids:
+                    story_id = f"hn_{item.get('id')}"
+                    if alert_store.is_seen(story_id):
                         continue
 
                     title = item.get("title", "")
                     score = item.get("score", 0)
-                    title_lower = title.lower()
 
-                    # Match keyword and score
-                    has_keyword = any(k in title_lower for k in kw)
-                    if has_keyword and score >= self.min_score:
-                        url = item.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
-                        hn_url = f"https://news.ycombinator.com/item?id={story_id}"
+                    if score >= self.min_score and self.is_relevant(title):
+                        url = item.get("url") or f"https://news.ycombinator.com/item?id={item.get('id')}"
+                        hn_url = f"https://news.ycombinator.com/item?id={item.get('id')}"
                         matched_stories.append({
                             "id": story_id,
                             "title": title,
@@ -86,9 +145,9 @@ class HNScanner:
                         })
 
         except Exception as e:
-            logger.exception(f"Error scanning Hacker News via Firebase: {e}")
+            logger.exception(f"Error scanning Hacker News: {e}")
 
         return matched_stories
 
     def mark_as_seen(self, story_id: str):
-        self.seen_story_ids.add(story_id)
+        alert_store.mark_seen(story_id)

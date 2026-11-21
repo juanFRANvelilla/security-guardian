@@ -74,4 +74,10 @@ spec:
             timeoutSeconds: 5
             successThreshold: 1
             failureThreshold: 3
+          volumeMounts:
+            - name: data-storage
+              mountPath: /app/data
+      volumes:
+        - name: data-storage
+          emptyDir: {}
       restartPolicy: Always
